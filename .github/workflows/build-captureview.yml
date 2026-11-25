@@ -1,0 +1,27 @@
+name: Build CaptureView portable
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: DdogezD/captureview
+          ref: master
+      - name: Install Rust
+        run: rustup default stable-x86_64-pc-windows-msvc
+      - name: Build portable version
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'dist/captureview/captureview.exe')) { throw 'EXE missing' }
+          Set-Content -Path 'dist/captureview/PLAY.cmd' -Encoding ascii -Value '@echo off','cd /d "%~dp0"','captureview.exe --video "USB3.0 Video" --size 1920x1080 --fps 60 --fullscreen','pause'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CaptureView-Windows-x64
+          path: dist/captureview/
+          if-no-files-found: error
