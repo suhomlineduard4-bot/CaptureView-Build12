@@ -1,0 +1,266 @@
+name: Build CaptureView MJPEG experimental
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: DdogezD/captureview
+          ref: master
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup default stable-x86_64-pc-windows-msvc
+      - name: Apply MJPEG patch
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          # Apply to upstream CaptureView; fail closed if the upstream layout changed.
+          def change(text, old, new):
+              n = text.count(old)
+              if n != 1:
+                  raise RuntimeError(f'Expected one anchor, got {n}: {old[:90]}')
+              return text.replace(old, new, 1)
+
+          def load(path):
+              return Path(path).read_text(encoding='utf-8-sig')
+
+          def save(path, text):
+              Path(path).write_text(text, encoding='utf-8')
+
+          p = 'native/dshow_capture.cpp'
+          s = load(p)
+          s = change(s, '#include <atomic>', '#include <atomic>\n#include <vector>')
+          s = change(s, '!IsEqualGUID(mt->subtype, MEDIASUBTYPE_YUY2)) return false;',
+              '(!IsEqualGUID(mt->subtype, MEDIASUBTYPE_YUY2) &&\n         !IsEqualGUID(mt->subtype, MEDIASUBTYPE_MJPG))) return false;')
+          s = change(s, '*out_stride = stride;', '*out_stride = mt->subtype == MEDIASUBTYPE_MJPG ? 0 : stride;')
+          s = change(s, 'const bool native_yuy2 =\n            cv_extract_video_info(',
+              'const bool native_yuy2 = mt->subtype == MEDIASUBTYPE_YUY2 &&\n            cv_extract_video_info(')
+          # Select only advertised MJPG frame sizes; preserve the compressed header.
+          helper = r"""
+          static HRESULT cv_select_mjpg_mode(IAMStreamConfig* config, uint32_t w,
+                                            uint32_t h, uint32_t fps, LONG* stride,
+                                            REFERENCE_TIME* interval) {
+              int count = 0, cap_size = 0;
+              HRESULT hr = config->GetNumberOfCapabilities(&count, &cap_size);
+              if (FAILED(hr)) return hr;
+              if (cap_size < (int)sizeof(VIDEO_STREAM_CONFIG_CAPS) || cap_size > 65536)
+                  return E_FAIL;
+              std::vector<BYTE> storage((size_t)cap_size);
+              const REFERENCE_TIME target = (10000000ull + fps / 2u) / fps;
+              for (int i = 0; i < count; ++i) {
+                  AM_MEDIA_TYPE* mt = nullptr;
+                  ZeroMemory(storage.data(), storage.size());
+                  hr = config->GetStreamCaps(i, &mt, storage.data());
+                  if (FAILED(hr) || !mt) {
+                      if (mt) cv_delete_media_type(mt);
+                      continue;
+                  }
+                  VIDEO_STREAM_CONFIG_CAPS caps = {};
+                  memcpy(&caps, storage.data(), sizeof(caps));
+                  LONG mw = 0, mh = 0;
+                  REFERENCE_TIME ft = 0;
+                  const bool matches = mt->subtype == MEDIASUBTYPE_MJPG &&
+                      cv_extract_video_info(mt, &mw, &mh, &ft, nullptr) &&
+                      mw == (LONG)w && mh == (LONG)h;
+                  const bool exact = ft > 0 && ft >= target - 2 && ft <= target + 2;
+                  const bool range = caps.MinFrameInterval > 0 &&
+                      target >= caps.MinFrameInterval && target <= caps.MaxFrameInterval;
+                  if (matches && (exact || range)) {
+                      if (!exact) cv_set_video_dimensions_and_interval(mt, mw, mh, target);
+                      hr = config->SetFormat(mt);
+                      if (SUCCEEDED(hr)) {
+                          *stride = 0;
+                          *interval = exact ? ft : target;
+                          fprintf(stderr, "[dshow] selected MJPG %ux%u @ %.3f fps (cap %d)\n",
+                              w, h, 10000000.0 / (double)*interval, i);
+                          cv_delete_media_type(mt);
+                          return S_OK;
+                      }
+                  }
+                  cv_delete_media_type(mt);
+              }
+              return VFW_E_INVALIDMEDIATYPE;
+          }
+
+          """
+          s = change(s, '// One-pin enumerator for the custom sink filter.', helper + '// One-pin enumerator for the custom sink filter.')
+          # Only accept known, size-matched formats. Zero stride is a compressed MJPG tag.
+          s = change(s, 'HRESULT hr = cv_copy_media_type(&connection_mt_, mt);', r"""LONG verified_w = 0, verified_h = 0, verified_stride = 0;
+                  REFERENCE_TIME verified_interval = 0;
+                  if (!cv_extract_video_info(mt, &verified_w, &verified_h,
+                                             &verified_interval, &verified_stride) ||
+                      verified_w != (LONG)width_ || verified_h != (LONG)height_ ||
+                      ((stride_ == 0) != (mt->subtype == MEDIASUBTYPE_MJPG))) {
+                      return VFW_E_TYPE_NOT_ACCEPTED;
+                  }
+                  HRESULT hr = cv_copy_media_type(&connection_mt_, mt);""")
+          s = change(s, 'if ((uint64_t)data_len >= minimum && height_ > 0 && data_len % (long)height_ == 0)',
+              'if (stride != 0 && (uint64_t)data_len >= minimum && height_ > 0 && data_len % (long)height_ == 0)')
+          s = change(s, 'hr = cv_select_native_yuy2(stream_config, width, height, fps, &stride, &frame_time);', r"""{
+                  wchar_t requested[16] = {};
+                  GetEnvironmentVariableW(L"CV_CAPTURE_FORMAT", requested, 16);
+                  const bool force_mjpg = _wcsicmp(requested, L"MJPEG") == 0;
+                  const bool force_yuy2 = _wcsicmp(requested, L"YUY2") == 0;
+                  hr = force_mjpg ? VFW_E_INVALIDMEDIATYPE :
+                      cv_select_native_yuy2(stream_config, width, height, fps, &stride, &frame_time);
+                  if (FAILED(hr) && !force_yuy2) {
+                      hr = cv_select_mjpg_mode(stream_config, width, height, fps, &stride, &frame_time);
+                  }
+              }""")
+          s = change(s, 'requested native YUY2 resolution/framerate was not exposed by DirectShow',
+              'requested YUY2/MJPG resolution and framerate unavailable (check --list-capabilities)')
+          s = change(s, 'const bool yuy2_ok =\n                cv_extract_video_info(&connected_mt, &cw, &ch, &cft, &cs) &&',
+              'const bool yuy2_ok =\n                selected_mt->subtype == connected_mt.subtype &&\n                cv_extract_video_info(&connected_mt, &cw, &ch, &cft, &cs) &&')
+          s = change(s, 'DirectShow connected a non-YUY2 or unexpected-size media type', 'DirectShow connected an unexpected media subtype or frame size')
+          s = change(s, 'connected_mt.subtype == MEDIASUBTYPE_YUY2 ? "YUY2" : "non-YUY2"', 'connected_mt.subtype == MEDIASUBTYPE_YUY2 ? "YUY2" : "MJPG"')
+          s = change(s, 'mt->subtype == MEDIASUBTYPE_YUY2 ? "YUY2" : "non-YUY2"', 'mt->subtype == MEDIASUBTYPE_YUY2 ? "YUY2" : "MJPG"')
+          s = change(s, 'IMemInputPin::Receive, YUY2 %ux%u', 'IMemInputPin::Receive, YUY2/MJPG %ux%u')
+          save(p, s)
+
+          p = 'Cargo.toml'
+          s = change(load(p), 'features = ["ico", "png"]', 'features = ["ico", "png", "jpeg"]')
+          save(p, s)
+
+          p = 'src/capture.rs'
+          s = load(p)
+          s = change(s, 'let Some(frame) = extract_yuy2_raw_fast(data, data_len, stride, width, height, &mut planes)', r"""let decoded = if stride == 0 {
+                  let jpeg = unsafe { std::slice::from_raw_parts(data, data_len) };
+                  decode_mjpg(jpeg, width, height, &mut planes)
+              } else {
+                  extract_yuy2_raw_fast(data, data_len, stride, width, height, &mut planes)
+              };
+              let Some(frame) = decoded""")
+          s = change(s, 'context.detect_no_signal && sparse_no_signal_black(&frame, sequence)', 'context.detect_no_signal && stride != 0 && sparse_no_signal_black(&frame, sequence)')
+          s = change(s, 'native YUY2 {}x{} @ {}fps', 'native YUY2/MJPG {}x{} @ {}fps')
+          # JPEG decode -> full-range BT.601 4:2:2 planes; existing GPU shader renders them.
+          rust = r"""
+          fn decode_mjpg(jpeg: &[u8], width: u32, height: u32, planes: &mut PlaneSet) -> Option<CaptureFrame> {
+              use image::ImageDecoder;
+              static WARNED: AtomicBool = AtomicBool::new(false);
+              let result = (|| -> Option<CaptureFrame> {
+                  if width == 0 || height == 0 || width & 1 != 0 || width > 4096 || height > 2160 {
+                      return None;
+                  }
+                  let decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg)).ok()?;
+                  if decoder.dimensions() != (width, height) { return None; }
+                  let rgb = image::DynamicImage::from_decoder(decoder).ok()?.into_rgb8();
+                  let bytes = rgb.as_raw();
+                  fn yuv(pixel: &[u8]) -> (i32, i32, i32) {
+                      let (r, g, b) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
+                      ((77*r + 150*g + 29*b + 128) >> 8,
+                       ((-43*r - 85*g + 128*b + 128) >> 8) + 128,
+                       ((128*r - 107*g - 21*b + 128) >> 8) + 128)
+                  }
+                  for (i, pair) in bytes.chunks_exact(6).enumerate() {
+                      let (y0, u0, v0) = yuv(&pair[..3]);
+                      let (y1, u1, v1) = yuv(&pair[3..]);
+                      planes.y[2*i] = y0.clamp(0,255) as u8;
+                      planes.y[2*i+1] = y1.clamp(0,255) as u8;
+                      planes.u[i] = ((u0+u1+1)/2).clamp(0,255) as u8;
+                      planes.v[i] = ((v0+v1+1)/2).clamp(0,255) as u8;
+                  }
+                  Some(CaptureFrame::Cpu {
+                      width, height, format: PixelFormat::Yuvj422p,
+                      y_data: std::mem::take(&mut planes.y),
+                      u_data: std::mem::take(&mut planes.u),
+                      v_data: std::mem::take(&mut planes.v),
+                  })
+              })();
+              if result.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
+                  warn!("MJPEG decode failed or frame dimensions differ; dropping invalid sample");
+              }
+              result
+          }
+
+          #[cfg(test)]
+          mod mjpg_tests {
+              use super::*;
+              #[test]
+              fn mjpg_decode_neutral_gray() {
+                  let mut jpeg = Vec::new();
+                  image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+                      .encode(&[128u8; 8*4*3], 8, 4, image::ExtendedColorType::Rgb8).unwrap();
+                  let mut planes = PlanePool::new().checkout(8,4);
+                  let frame = decode_mjpg(&jpeg,8,4,&mut planes).expect("JPEG must decode");
+                  let CaptureFrame::Cpu {format,y_data,u_data,v_data,..} = frame;
+                  assert_eq!(format, PixelFormat::Yuvj422p);
+                  assert_eq!(y_data.len(),32);
+                  assert_eq!(u_data.len(),16);
+                  assert_eq!(v_data.len(),16);
+                  assert!(y_data.iter().chain(&u_data).chain(&v_data).all(|v| v.abs_diff(128) <= 3));
+              }
+              #[test]
+              fn rejects_invalid_jpeg() {
+                  let mut planes = PlanePool::new().checkout(8,4);
+                  assert!(decode_mjpg(&[0,1,2],8,4,&mut planes).is_none());
+              }
+          }
+
+          """
+          s = change(s, 'fn extract_yuy2_raw_fast(', rust + 'fn extract_yuy2_raw_fast(')
+          save(p, s)
+          p = 'src/main.rs'
+          s = load(p)
+          s = change(s, 'Native YUY2 only', 'Native YUY2 / experimental MJPEG; CV_CAPTURE_FORMAT=MJPEG or YUY2 (default auto)')
+          s = change(s, 'Native YUY2 capture size', 'Native capture size')
+          s = change(s, 'format=YUY2, backend=', 'format=YUY2/MJPG, backend=')
+          s = change(s, '@ {}fps YUY2"', '@ {}fps YUY2/MJPG"')
+          save(p,s)
+          print('CaptureView MJPEG experimental patch applied.')
+          '@ | Set-Content -Encoding utf8 cv_mjpg_patch.py
+          python cv_mjpg_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --stat
+      - name: Run tests
+        run: cargo test --release
+      - name: Build portable version
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dist = 'dist/captureview'
+          if (-not (Test-Path "$dist/captureview.exe")) { throw 'EXE missing' }
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "CV_CAPTURE_FORMAT=MJPEG"
+          captureview.exe --video "USB3.0 Video" --size 1920x1080 --fps 50 --audio-input "USB3.0 Audio" --fullscreen
+          pause
+          '@ | Set-Content -Encoding ascii "$dist/PLAY-MJPEG-50.cmd"
+          (Get-Content "$dist/PLAY-MJPEG-50.cmd" -Raw).Replace('--fps 50','--fps 60') | Set-Content -Encoding ascii "$dist/PLAY-MJPEG-60.cmd"
+          (Get-Content "$dist/PLAY-MJPEG-50.cmd" -Raw).Replace('--audio-input "USB3.0 Audio"','--no-audio') | Set-Content -Encoding ascii "$dist/PLAY-MJPEG-VIDEO-ONLY.cmd"
+          @'
+          @echo off
+          cd /d "%~dp0"
+          captureview.exe --video "USB3.0 Video" --list-capabilities
+          pause
+          '@ | Set-Content -Encoding ascii "$dist/LIST-MODES.cmd"
+          @'
+          @echo off
+          cd /d "%~dp0"
+          captureview.exe --list-devices
+          pause
+          '@ | Set-Content -Encoding ascii "$dist/LIST-DEVICES.cmd"
+          @'
+          Experimental MJPEG patch. Use PLAY-MJPEG-50.cmd first.
+          PLAY-MJPEG-60.cmd requires the card to expose that exact mode.
+          PLAY-MJPEG-VIDEO-ONLY.cmd isolates video problems.
+          Audio output uses the Windows default; use --audio-output with a device name if needed.
+          MJPEG is CPU-decoded and then rendered using the existing GPU pipeline.
+          Strict black/no-signal detection is disabled on MJPEG frames; do not use auto-exit/probe with MJPEG.
+          No hardware validation has been performed by the patch author.
+          '@ | Set-Content -Encoding ascii "$dist/MJPEG-README.txt"
+          Copy-Item cv_mjpg_patch.py "$dist/cv_mjpg_patch.py"
+          git rev-parse HEAD | Set-Content -Encoding ascii "$dist/UPSTREAM-COMMIT.txt"
+          git diff | Set-Content -Encoding utf8 "$dist/MJPEG-source.diff"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CaptureView-MJPEG-Windows-x64
+          path: dist/captureview/
+          if-no-files-found: error
